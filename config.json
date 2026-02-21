@@ -2,6 +2,7 @@
   "keys": [
     "sk-deepseek2api"
   ],
+  "debug_mode": false,
   "auto_upload_token_threshold": 400000,
   "auto_upload_char_threshold_max": 700000,
   "auto_upload_char_threshold_min": 400000,
