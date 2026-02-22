@@ -1228,15 +1228,106 @@ def format_tools_to_system_prompt(tools: list) -> str:
             prompt += f"Description: {func.get('description', '')}\n"
             prompt += f"Parameters: {json.dumps(func.get('parameters', {}), ensure_ascii=False)}\n\n"
     
-    prompt += """If you want to call a tool, you MUST output a JSON block wrapped in <tool_call> and </tool_call> tags. 
+    prompt += """If you want to call tools, you MUST output ONE JSON block wrapped in <tool_calls> and </tool_calls> tags.
 DO NOT output any other XML tags for tool calls.
 Format:
-<tool_call>
-{"name": "tool_name", "arguments": {"arg1": "value1"}}
-</tool_call>
+<tool_calls>
+{"tool_calls":[{"id":"tc_1","name":"tool_name","input":{"arg1":"value1"}}]}
+</tool_calls>
 
-You can call multiple tools by outputting multiple <tool_call> blocks."""
+You can call multiple tools by adding multiple items in the tool_calls array.
+If no tool is needed, output normal text response."""
     return prompt
+
+
+def extract_tool_calls_from_obj(obj) -> list:
+    """从 JSON 对象提取统一格式的工具调用列表: [{id, name, input}]"""
+    extracted = []
+
+    if not isinstance(obj, dict):
+        return extracted
+
+    if isinstance(obj.get("tool_calls"), list):
+        source_calls = obj.get("tool_calls", [])
+    elif obj.get("name"):
+        source_calls = [obj]
+    else:
+        return extracted
+
+    for idx, item in enumerate(source_calls):
+        if not isinstance(item, dict):
+            continue
+
+        func = item.get("function") if isinstance(item.get("function"), dict) else {}
+        name = item.get("name") or func.get("name")
+        if not name:
+            continue
+
+        tool_input = item.get("input")
+        if tool_input is None:
+            tool_input = item.get("arguments")
+        if tool_input is None:
+            tool_input = func.get("arguments")
+
+        if isinstance(tool_input, str):
+            try:
+                tool_input = json.loads(tool_input)
+            except Exception:
+                tool_input = {"raw": tool_input}
+        elif tool_input is None:
+            tool_input = {}
+
+        extracted.append(
+            {
+                "id": item.get("id") or f"tc_{idx + 1}",
+                "name": name,
+                "input": tool_input if isinstance(tool_input, dict) else {"raw": str(tool_input)},
+            }
+        )
+
+    return extracted
+
+
+def extract_tagged_tool_calls(text: str):
+    """解析文本中的 <tool_calls> 标签，返回 (清理后文本, 工具调用列表)。"""
+    if not text:
+        return "", []
+
+    remaining = text
+    parsed_calls = []
+    cleaned_parts = []
+
+    while remaining:
+        pos_calls = remaining.find("<tool_calls>")
+        if pos_calls == -1:
+            cleaned_parts.append(remaining)
+            break
+
+        start = pos_calls
+        if start > 0:
+            cleaned_parts.append(remaining[:start])
+
+        start_tag = "<tool_calls>"
+        end_tag = "</tool_calls>"
+
+        payload_start = start + len(start_tag)
+        end = remaining.find(end_tag, payload_start)
+        if end == -1:
+            # 未闭合标签：从 <tool_calls> 开始全部截断，避免把标签/历史内容回显给用户
+            break
+
+        payload = remaining[payload_start:end].strip()
+        try:
+            obj = json.loads(payload)
+            parsed_calls.extend(extract_tool_calls_from_obj(obj))
+        except Exception as e:
+            logger.warning(f"[tool_parse] 解析工具调用失败: {e}")
+            # 畸形标签：直接丢弃，避免把原始工具协议暴露给用户
+
+        remaining = remaining[end + len(end_tag) :]
+
+    cleaned_text = "".join(cleaned_parts).strip()
+    return cleaned_text, parsed_calls
 
 def _content_to_str(content) -> str:
     """将 content 统一转换为字符串（兼容 OpenAI 多模态 list 格式）"""
@@ -1272,18 +1363,26 @@ def process_messages_for_tools(messages: list) -> list:
         # 如果是 assistant 包含了 tool_calls
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
             content = msg.get("content") or ""
+            payload_calls = []
             for tc in msg.get("tool_calls"):
                 func = tc.get("function", {})
-                
-                # Handle args correctly, sometimes string sometimes dict
                 args = func.get("arguments", {})
                 if isinstance(args, str):
                     try:
                         args = json.loads(args)
                     except:
-                        pass
-                
-                content += f'\n<tool_call>\n{{"name": "{func.get("name")}", "arguments": {json.dumps(args, ensure_ascii=False)}}}\n</tool_call>\n'
+                        args = {"raw": args}
+
+                payload_calls.append(
+                    {
+                        "id": tc.get("id") or f"tc_{len(payload_calls) + 1}",
+                        "name": func.get("name"),
+                        "input": args if isinstance(args, dict) else {"raw": str(args)},
+                    }
+                )
+
+            if payload_calls:
+                content += f'\n<tool_calls>\n{json.dumps({"tool_calls": payload_calls}, ensure_ascii=False)}\n</tool_calls>\n'
             msg["content"] = content.strip()
             
         # 如果是 tool 结果回复
@@ -1490,6 +1589,7 @@ async def chat_completions(request: Request):
                     # Tool calling buffer state
                     text_buffer = ""
                     in_tool_call = False
+                    current_end_tag = "</tool_calls>"
                     has_tool_calls_streamed = False
                     tool_call_index = 0
 
@@ -1667,6 +1767,10 @@ async def chat_completions(request: Request):
                             chunk = result_queue.get(timeout=KEEP_ALIVE_TIMEOUT/2)
                             if chunk is None:
                                 if text_buffer:
+                                    # 结束时如果残留未闭合 <tool_calls>，截断标签后的内容
+                                    pending_pos = text_buffer.find("<tool_calls>")
+                                    if pending_pos != -1:
+                                        text_buffer = text_buffer[:pending_pos]
                                     final_text += text_buffer
                                     if not has_tool_calls_streamed:
                                         file_info_chunk = {
@@ -1757,10 +1861,9 @@ async def chat_completions(request: Request):
                                     
                                     while len(text_buffer) > 0:
                                         if not in_tool_call:
-                                            pos = text_buffer.find("<tool_call>")
+                                            pos = text_buffer.find("<tool_calls>")
                                             if pos != -1:
                                                 before_text = text_buffer[:pos]
-                                                logger.debug(f"[tool_detect] ✅ 检测到 <tool_call> at pos={pos}, 前置文本='{before_text[:30]}'")
                                                 if before_text:
                                                     final_text += before_text
                                                     delta_obj = {"content": before_text}
@@ -1768,14 +1871,16 @@ async def chat_completions(request: Request):
                                                         delta_obj["role"] = "assistant"
                                                         first_chunk_sent = True
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
+
+                                                current_start_tag = "<tool_calls>"
+                                                current_end_tag = "</tool_calls>"
                                                 in_tool_call = True
-                                                text_buffer = text_buffer[pos + len("<tool_call>"):]
+                                                text_buffer = text_buffer[pos + len(current_start_tag):]
                                             else:
-                                                # Check if ending might be <tool_call> prefix
                                                 safe_len = len(text_buffer)
-                                                for i in range(1, len("<tool_call>")):
-                                                    if text_buffer.endswith("<tool_call>"[:i]):
-                                                        safe_len -= i
+                                                for i in range(1, len("<tool_calls>")):
+                                                    if text_buffer.endswith("<tool_calls>"[:i]):
+                                                        safe_len = min(safe_len, len(text_buffer) - i)
                                                         break
                                                 safe_text = text_buffer[:safe_len]
                                                 text_buffer = text_buffer[safe_len:]
@@ -1786,51 +1891,47 @@ async def chat_completions(request: Request):
                                                         delta_obj["role"] = "assistant"
                                                         first_chunk_sent = True
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
-                                                break # Wait for more data
+                                                break
                                         else:
-                                            pos = text_buffer.find("</tool_call>")
+                                            pos = text_buffer.find(current_end_tag)
                                             if pos != -1:
                                                 tool_json_str = text_buffer[:pos]
-                                                logger.debug(f"[tool_detect] ✅ 检测到 </tool_call>, JSON内容='{tool_json_str.strip()[:80]}'")
-                                                text_buffer = text_buffer[pos + len("</tool_call>"):]
+                                                text_buffer = text_buffer[pos + len(current_end_tag):]
                                                 in_tool_call = False
-                                                
+
                                                 try:
                                                     parsed = json.loads(tool_json_str.strip())
-                                                    t_name = parsed.get("name", "")
-                                                    t_args = parsed.get("arguments", "{}")
-                                                    if isinstance(t_args, dict):
-                                                        t_args = json.dumps(t_args, ensure_ascii=False)
-                                                    elif not isinstance(t_args, str):
-                                                        t_args = str(t_args)
-                                                    
-                                                    delta_obj = {
-                                                        "tool_calls": [{
-                                                            "index": tool_call_index,
-                                                            "id": f"call_{tool_call_index}_{int(time.time())}",
-                                                            "type": "function",
-                                                            "function": {
-                                                                "name": t_name,
-                                                                "arguments": t_args
-                                                            }
-                                                        }]
-                                                    }
-                                                    if not first_chunk_sent:
-                                                        delta_obj["role"] = "assistant"
-                                                        first_chunk_sent = True
-                                                    new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
-                                                    has_tool_calls_streamed = True
-                                                    tool_call_index += 1
+                                                    parsed_calls = extract_tool_calls_from_obj(parsed)
+
+                                                    for parsed_call in parsed_calls:
+                                                        t_args = json.dumps(parsed_call.get("input", {}), ensure_ascii=False)
+                                                        delta_obj = {
+                                                            "tool_calls": [{
+                                                                "index": tool_call_index,
+                                                                "id": parsed_call.get("id") or f"call_{tool_call_index}_{int(time.time())}",
+                                                                "type": "function",
+                                                                "function": {
+                                                                    "name": parsed_call.get("name", ""),
+                                                                    "arguments": t_args
+                                                                }
+                                                            }]
+                                                        }
+                                                        if not first_chunk_sent:
+                                                            delta_obj["role"] = "assistant"
+                                                            first_chunk_sent = True
+                                                        new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
+                                                        has_tool_calls_streamed = True
+                                                        tool_call_index += 1
                                                 except Exception as e:
                                                     logger.warning(f"Failed to parse tool call json: {e}")
-                                                    delta_obj = {"content": f"\n<tool_call>{tool_json_str}</tool_call>\n"}
+                                                    delta_obj = {"content": f"\n<tool_calls>{tool_json_str}</tool_calls>\n"}
                                                     final_text += delta_obj["content"]
                                                     if not first_chunk_sent:
                                                         delta_obj["role"] = "assistant"
                                                         first_chunk_sent = True
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                             else:
-                                                break # Wait for ending tag
+                                                break
                             if new_choices:
                                 out_chunk = {
                                     "id": completion_id,
@@ -1989,39 +2090,18 @@ async def chat_completions(request: Request):
                         final_reasoning = "".join(think_list)  # 修复：应该使用think_list而不是text_list
                         
                         # --- 检测并解析 tool_calls ---
+                        final_content, parsed_calls = extract_tagged_tool_calls(final_content)
                         tool_calls = []
-                        
-                        while "<tool_call>" in final_content and "</tool_call>" in final_content:
-                            start_idx = final_content.find("<tool_call>")
-                            end_idx = final_content.find("</tool_call>", start_idx)
-                            if end_idx == -1:
-                                break
-                            
-                            json_str = final_content[start_idx + len("<tool_call>"):end_idx].strip()
-                            
-                            try:
-                                parsed = json.loads(json_str)
-                                args = parsed.get("arguments", "{}")
-                                if isinstance(args, dict):
-                                    args = json.dumps(args, ensure_ascii=False)
-                                elif not isinstance(args, str):
-                                    args = str(args)
-                                    
-                                tool_calls.append({
-                                    "id": f"call_{len(tool_calls)}_{int(time.time())}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": parsed.get("name", ""),
-                                        "arguments": args
-                                    }
-                                })
-                            except Exception as e:
-                                logger.warning(f"解析 tool_call 失败: {json_str}, error: {e}")
-                                
-                            # 移除这部分 tool_call
-                            final_content = final_content[:start_idx] + final_content[end_idx + len("</tool_call>"):]
-                        
-                        final_content = final_content.strip()
+                        for idx, parsed_call in enumerate(parsed_calls):
+                            args = json.dumps(parsed_call.get("input", {}), ensure_ascii=False)
+                            tool_calls.append({
+                                "id": parsed_call.get("id") or f"call_{idx}_{int(time.time())}",
+                                "type": "function",
+                                "function": {
+                                    "name": parsed_call.get("name", ""),
+                                    "arguments": args,
+                                },
+                            })
 
                         # 追加文件信息
                         if upload_tags["return_fileid"] and uploaded_file_info:
@@ -2183,12 +2263,14 @@ async def claude_messages(request: Request):
 
 {chr(10).join(tool_schemas)}
 
-When you need to use tools, you can call multiple tools in a single response. Use this format:
+When you need to use tools, you can call multiple tools in a single response. Use this exact tagged format:
 
+<tool_calls>
 {{"tool_calls": [
-  {{"name": "tool1", "input": {{"param": "value"}}}},
-  {{"name": "tool2", "input": {{"param": "value"}}}}
+  {{"id": "tc_1", "name": "tool1", "input": {{"param": "value"}}}},
+  {{"id": "tc_2", "name": "tool2", "input": {{"param": "value"}}}}
 ]}}
+</tool_calls>
 
 IMPORTANT: You can call multiple tools in ONE response. If you need to:
 1. Create a directory - include that in tool_calls
@@ -2206,7 +2288,7 @@ Examples:
 - For str_replace_editor: {{"name": "str_replace_editor", "input": {{"command": "create", "path": "file.py", "file_text": "code"}}}}
 - For Bash: {{"name": "Bash", "input": {{"command": "cd /path && python file.py"}}}}
 
-Remember: Output ONLY the JSON, no other text. The response must start with {{ and end with ]}}"""
+Remember: If calling tools, output ONLY the tagged block and nothing else."""
             }
             payload["messages"].insert(0, system_message)
 
@@ -2284,16 +2366,20 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                     
                     # 2. 检查是否有工具调用 - 改进的检测逻辑
                     detected_tools = []
-                    
-                    # 清理响应文本
-                    cleaned_response = full_response_text.strip()
+
+                    # 优先解析标签协议
+                    cleaned_response, tagged_calls = extract_tagged_tool_calls(full_response_text)
+                    for call in tagged_calls:
+                        tool_name = call.get('name')
+                        tool_input = call.get('input', {})
+                        if any(tool.get('name') == tool_name for tool in tools_requested):
+                            detected_tools.append({'name': tool_name, 'input': tool_input, 'id': call.get('id')})
                     
                     # 记录原始响应用于调试
                     logger.debug(f"[Tool Detection] Raw response: {cleaned_response[:500] if cleaned_response else 'Empty'}")
                     
                     # 尝试多种工具调用检测方法
-                    detected_tools = []
-                    tool_detected = False
+                    tool_detected = len(detected_tools) > 0
                     
                     # 方法1: 检测完整的JSON格式
                     if cleaned_response.startswith('{"tool_calls":') and cleaned_response.endswith(']}'):
@@ -2308,7 +2394,8 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                                 if any(tool.get('name') == tool_name for tool in tools_requested):
                                     detected_tools.append({
                                         'name': tool_name,
-                                        'input': tool_input
+                                        'input': tool_input,
+                                        'id': tool_call.get('id')
                                     })
                                     tool_detected = True
                         except json.JSONDecodeError:
@@ -2333,7 +2420,8 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                                     if any(tool.get('name') == tool_name for tool in tools_requested):
                                         detected_tools.append({
                                             'name': tool_name,
-                                            'input': tool_input
+                                            'input': tool_input,
+                                            'id': tool_call.get('id')
                                         })
                                         tool_detected = True
                             except json.JSONDecodeError:
@@ -2364,7 +2452,7 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                         # 有工具调用
                         stop_reason = "tool_use"
                         for tool_info in detected_tools:
-                            tool_use_id = f"toolu_{int(time.time())}_{random.randint(1000, 9999)}_{content_index}"
+                            tool_use_id = tool_info.get('id') or f"toolu_{int(time.time())}_{random.randint(1000, 9999)}_{content_index}"
                             tool_name = tool_info['name']
                             tool_input = tool_info['input']
                             
@@ -2479,12 +2567,17 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                 
                 # 检查是否包含工具调用 - 改进的检测逻辑
                 detected_tools = []
-                
-                # 清理响应文本
-                cleaned_content = final_content.strip()
+
+                # 优先解析标签协议
+                cleaned_content, tagged_calls = extract_tagged_tool_calls(final_content)
+                for call in tagged_calls:
+                    tool_name = call.get('name')
+                    tool_input = call.get('input', {})
+                    if any(tool.get('name') == tool_name for tool in tools_requested):
+                        detected_tools.append({'name': tool_name, 'input': tool_input, 'id': call.get('id')})
                 
                 # 尝试多种工具调用检测方法
-                tool_detected = False
+                tool_detected = len(detected_tools) > 0
                 
                 # 方法1: 检测完整的JSON格式
                 if cleaned_content.startswith('{"tool_calls":') and cleaned_content.endswith(']}'):
@@ -2498,7 +2591,8 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                             if any(tool.get('name') == tool_name for tool in tools_requested):
                                 detected_tools.append({
                                     'name': tool_name,
-                                    'input': tool_input
+                                    'input': tool_input,
+                                    'id': tool_call.get('id')
                                 })
                                 tool_detected = True
                     except json.JSONDecodeError:
@@ -2523,7 +2617,8 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                                 if any(tool.get('name') == tool_name for tool in tools_requested):
                                     detected_tools.append({
                                         'name': tool_name,
-                                        'input': tool_input
+                                        'input': tool_input,
+                                        'id': tool_call.get('id')
                                     })
                                     tool_detected = True
                         except json.JSONDecodeError:
@@ -2574,7 +2669,7 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                 # 处理工具调用
                 if detected_tools:
                     for i, tool_info in enumerate(detected_tools):
-                        tool_use_id = f"toolu_{int(time.time())}_{random.randint(1000, 9999)}_{i}"
+                        tool_use_id = tool_info.get('id') or f"toolu_{int(time.time())}_{random.randint(1000, 9999)}_{i}"
                         tool_name = tool_info['name']
                         tool_input = tool_info['input']
                         

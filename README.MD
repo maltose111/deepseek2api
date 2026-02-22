@@ -54,6 +54,14 @@
 
 配置 config.json
 
+可先复制示例配置（推荐）：
+```shell
+cp config.json.example config.json
+```
+
+> [!IMPORTANT]
+> `config.json` 已在 `.gitignore` 中，请不要提交包含真实账号密码或 token 的配置文件。
+
 在 `deepseek` 目录下，创建 config.json文件
 ```json
 {
@@ -122,6 +130,7 @@ cd deepseek2api
 配置 config.json
 
 在当前目录下，修改 config.json 文件
+ * 可直接复制 `config.json.example` 后按需修改
  * keys - 你的 API 鉴权密钥
  * accounts - DeepSeek 账号列表，支持多个账号轮换，避免单账号受限
 
@@ -157,6 +166,7 @@ docker stop deepseek2api
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/import/project?template=https://github.com/iidamie/deepseek2api)
 
 部署完后，返回你的 Github 仓库配置 config.json
+ * 可直接复制 `config.json.example` 后按需修改
  * keys - 你的 API 鉴权密钥
  * accounts - DeepSeek 账号列表，支持多个账号轮换，避免单账号受限
 
@@ -182,6 +192,7 @@ pip install -r requirements.txt
 配置 config.json
 
 在当前目录下，修改 config.json 文件
+ * 可直接复制 `config.json.example` 后按需修改
  * keys - 你的 API 鉴权密钥
  * accounts - DeepSeek 账号列表，支持多个账号轮换，避免单账号受限
 
